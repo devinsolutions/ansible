@@ -50,6 +50,8 @@ options:
   xml:
     description:
       - XML document used with the define command.
+      - If updating a domain, the XML must contain both `name` and `uuid` tag, otherwise the update
+        will fail with "domain already exists" error. See examples on how to get the UUID.
       - Must be raw XML content using C(lookup). XML cannot be reference to a file.
 requirements:
     - python >= 2.6
@@ -107,6 +109,19 @@ EXAMPLES = '''
     command: list_vms
     state: running
   register: running_vms
+
+# Getting UUID of existing VM
+- name: Get foo domain XML
+  virt:
+    command: get_xml
+    name: foo
+  register: foo_domain_xml
+- name: Get foo domain UUID
+  xml:
+    xmlstring: "{{ foo_domain_xml.get_xml }}"
+    xpath: /domain/uuid
+    content: text
+  register: domain_uuid  # Found UUID will be in domain_uuid.matches[0].uuid
 '''
 
 RETURN = '''
@@ -128,6 +143,7 @@ status:
 '''
 
 import traceback
+import xml.etree.ElementTree
 
 try:
     import libvirt
@@ -462,7 +478,7 @@ def core(module):
     guest = module.params.get('name', None)
     command = module.params.get('command', None)
     uri = module.params.get('uri', None)
-    xml = module.params.get('xml', None)
+    dom_xml = module.params.get('xml', None)
 
     v = Virt(uri, module)
     res = dict()
@@ -515,40 +531,42 @@ def core(module):
     if command:
         if command in VM_COMMANDS:
             if command == 'define':
-                if not xml:
+                if not dom_xml:
                     module.fail_json(msg="define requires xml argument")
                 if guest:
                     # there might be a mismatch between quest 'name' in the module and in the xml
                     module.warn("'xml' is given - ignoring 'name'")
-                found_name = re.search('<name>(.*)</name>', xml).groups()
-                if found_name:
-                    domain_name = found_name[0]
+
+                try:
+                    parsed_xml = xml.etree.ElementTree.fromstring(dom_xml)
+                except xml.etree.ElementTree.ParseError as e:
+                    module.fail_json(msg="Invalid XML: %s" % e)
+
+                found_name = parsed_xml.find("./name")
+                if found_name is not None and found_name.text:
+                    domain_name = found_name.text
                 else:
                     module.fail_json(msg="Could not find domain 'name' in xml")
 
-                # From libvirt docs (https://libvirt.org/html/libvirt-libvirt-domain.html#virDomainDefineXML):
-                # -- A previous definition for this domain would be overridden if it already exists.
-                #
-                # In real world testing with libvirt versions 1.2.17-13, 2.0.0-10 and 3.9.0-14
-                # on qemu and lxc domains results in:
-                # operation failed: domain '<name>' already exists with <uuid>
-                #
-                # In case a domain would be indeed overwritten, we should protect idempotency:
+                if parsed_xml.find("./uuid") is None:
+                    module.warn("'xml' is given without 'uuid' tag - this module won't be able to "
+                                "update the domain definition!")
+
                 try:
-                    existing_domain = v.get_vm(domain_name)
+                    existing_domain_xml = v.get_vm(domain_name).XMLDesc(
+                        libvirt.VIR_DOMAIN_XML_INACTIVE
+                    )
                 except VMNotFound:
-                    existing_domain = None
+                    existing_domain_xml = None
                 try:
-                    domain = v.define(xml)
-                    if existing_domain:
-                        # if we are here, then libvirt redefined existing domain as the doc promised
-                        if existing_domain.XMLDesc() != domain.XMLDesc():
+                    domain = v.define(dom_xml)
+                    if existing_domain_xml:
+                        if existing_domain_xml != domain.XMLDesc(libvirt.VIR_DOMAIN_XML_INACTIVE):
                             res = {'changed': True, 'change_reason': 'config changed'}
                     else:
                         res = {'changed': True, 'created': domain.name()}
                 except libvirtError as e:
-                    if e.get_error_code() != 9:  # 9 means 'domain already exists' error
-                        module.fail_json(msg='libvirtError: %s' % e.message)
+                    module.fail_json(msg='libvirtError: %s' % e.message)
                 if autostart is not None and v.autostart(domain_name, autostart):
                     res = {'changed': True, 'change_reason': 'autostart'}
 
